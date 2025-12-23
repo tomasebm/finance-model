@@ -1,0 +1,9 @@
+node_modules/
+.firebase/
+.ipynb_checkpoints/
+.env
+.env.local
+firebase-debug.log
+firestore-debug.log
+ui-debug.log
+*.log
