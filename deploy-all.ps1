@@ -67,11 +67,11 @@ gcloud run jobs execute $JOB_NAME --region $REGION --wait
 Write-Host "Creating Cloud Scheduler..."
 $RUN_URI = "https://$REGION-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/$PROJECT_ID/jobs/${JOB_NAME}:run"
 
-gcloud scheduler jobs create http $SCHEDULER_NAME --location $REGION --schedule "0 21 * * 1-5" --time-zone "America/Argentina/Buenos_Aires" --uri $RUN_URI --http-method POST --oauth-service-account-email $SA_EMAIL --quiet 2>$null
+gcloud scheduler jobs create http $SCHEDULER_NAME --location $REGION --schedule "0 22 * * 1-5" --time-zone "America/Argentina/Buenos_Aires" --uri $RUN_URI --http-method POST --oauth-service-account-email $SA_EMAIL --quiet 2>$null
 
 if ($LASTEXITCODE -ne 0) { 
     Write-Host "Scheduler exists, updating..."
-    gcloud scheduler jobs update http $SCHEDULER_NAME --location $REGION --schedule "0 21 * * 1-5" --time-zone "America/Argentina/Buenos_Aires" --uri $RUN_URI --http-method POST --oauth-service-account-email $SA_EMAIL
+    gcloud scheduler jobs update http $SCHEDULER_NAME --location $REGION --schedule "0 22 * * 1-5" --time-zone "America/Argentina/Buenos_Aires" --uri $RUN_URI --http-method POST --oauth-service-account-email $SA_EMAIL
 }
 
 Write-Host ""
