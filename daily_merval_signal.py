@@ -7,6 +7,8 @@ Fixes:
 - Robust yfinance parsing (MultiIndex, adj close fallback)
 - VIX jump division protection
 - Enforce BASE_SAFE_CORE floor in allocation
+- Cloud Logging for shock detection
+- Testing mode with FORCE_SHOCK_ALERT
 """
 
 import warnings
@@ -19,11 +21,11 @@ from datetime import datetime, timedelta, timezone
 import numpy as np
 import pandas as pd
 import yfinance as yf
-
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
 
 from google.cloud import bigquery
+from google.cloud import logging as cloud_logging
 
 # ===============================
 # CONFIG
@@ -31,8 +33,8 @@ from google.cloud import bigquery
 START_DATE = os.environ.get("START_DATE", "2015-01-01")
 
 # Portfolio: SPY = safe core, GGAL = tactical risk
-BASE_SAFE_CORE = float(os.environ.get("BASE_SAFE_CORE", "0.50"))         # Min % in SPY/USD
-MAX_RISK_ALLOCATION = float(os.environ.get("MAX_RISK_ALLOCATION", "0.50"))  # Max % in GGAL
+BASE_SAFE_CORE = float(os.environ.get("BASE_SAFE_CORE", "0.50"))
+MAX_RISK_ALLOCATION = float(os.environ.get("MAX_RISK_ALLOCATION", "0.50"))
 
 # Shock rules
 SHOCK_DAILY_RET = float(os.environ.get("SHOCK_DAILY_RET", "-0.055"))
@@ -58,6 +60,9 @@ TABLE = os.environ.get("BQ_TABLE", "daily_signal")
 # Output file
 CSV_PATH = os.environ.get("CSV_PATH", "daily_signal.csv")
 
+# Testing mode
+FORCE_SHOCK_ALERT = os.environ.get("FORCE_SHOCK_ALERT", "false").lower() == "true"
+
 
 # ===============================
 # HELPERS
@@ -77,7 +82,6 @@ def yf_fetch(ticker: str) -> pd.DataFrame:
         try:
             df.columns = df.columns.get_level_values(0)
         except Exception:
-            # fall back to stringifying
             df.columns = [str(c) for c in df.columns]
 
     # Normalize column names
@@ -93,6 +97,36 @@ def yf_fetch(ticker: str) -> pd.DataFrame:
     df["close"] = pd.to_numeric(df["close"], errors="coerce").ffill()
     df = df.dropna(subset=["close"])
     return df
+
+
+def log_shock_alert(date_str: str, latest_ret: float, vix_jump: float, forced: bool = False) -> None:
+    """
+    Logs shock detection to Cloud Logging with ERROR severity.
+    This triggers email alerts configured in Cloud Console.
+    """
+    try:
+        client = cloud_logging.Client(project=PROJECT_ID)
+        logger = client.logger("merval-shock-detector")
+        
+        message = "🚨 MERVAL SHOCK DETECTED"
+        if forced:
+            message = "🧪 TEST ALERT - FORCED SHOCK"
+        
+        logger.log_struct({
+            "message": message,
+            "date": date_str,
+            "merval_daily_return": f"{latest_ret:.2%}",
+            "vix_jump_2d": f"{vix_jump:.2%}",
+            "shock_threshold_ret": f"{SHOCK_DAILY_RET:.2%}",
+            "shock_threshold_vix": f"{VIX_JUMP_2D:.2%}",
+            "action": "Portfolio moved to 100% SPY (safe core)",
+            "forced_test": forced
+        }, severity="ERROR")
+        
+        print(f"✅ Shock alert logged to Cloud Logging")
+    except Exception as e:
+        print(f"⚠️ Failed to log shock alert: {e}")
+        traceback.print_exc()
 
 
 def save_to_bigquery(date: str,
@@ -134,6 +168,9 @@ def save_to_bigquery(date: str,
 # ===============================
 def main() -> None:
     print(f"Starting job at {datetime.now(timezone.utc).isoformat()}")
+    
+    if FORCE_SHOCK_ALERT:
+        print("⚠️  TESTING MODE: FORCE_SHOCK_ALERT is enabled")
 
     # Basic sanity: ensure portfolio constraints are consistent
     if BASE_SAFE_CORE < 0.0 or BASE_SAFE_CORE > 1.0:
@@ -160,14 +197,9 @@ def main() -> None:
     df["argt"] = argt["close"].reindex(idx).ffill()
 
     # 3. FEATURE ENGINEERING
-    # Upper bound 999 to handle extreme VIX spikes without NaNs
     df["vix_reg"] = pd.cut(df["vix"], [0, 15, 20, 30, 40, 999],
                            labels=[0, 1, 2, 3, 4]).astype(float)
-
-    # ARGT stress proxy
     df["argt_stress"] = -np.log(df["argt"]).diff()
-
-    # Momentum + volatility
     df["ret_5d"] = df["merval_ret"].rolling(5).sum()
     df["vol_10d"] = df["merval_ret"].rolling(10).std()
 
@@ -191,13 +223,12 @@ def main() -> None:
     if prev2_vix > 0:
         vix_jump = latest_vix / prev2_vix - 1.0
 
-    is_shock = (latest_ret <= SHOCK_DAILY_RET) or (vix_jump >= VIX_JUMP_2D)
+    is_shock = FORCE_SHOCK_ALERT or (latest_ret <= SHOCK_DAILY_RET) or (vix_jump >= VIX_JUMP_2D)
 
     # 5. TRAIN MODEL (Daily Walk-Forward)
-    # Label = tomorrow is a "bad day"
     label = (df["merval_ret"].shift(-1) < -0.02).astype(int)
 
-    train_df = df.iloc[:-1]          # All data except today
+    train_df = df.iloc[:-1]
     y_train = label.iloc[:-1]
     X_train_raw = train_df[feature_cols]
 
@@ -222,20 +253,31 @@ def main() -> None:
     # 7. THRESHOLD + SIGNAL
     vix_norm = float(np.clip(float(latest_row["vix_reg"].iloc[0]) / 4.0, 0.0, 1.0))
     thr = float(np.clip(BASE_THR - ALPHA * vix_norm, THR_MIN, THR_MAX))
-
-    # signal in [0,1] where 1 = fully risk-on
     signal_strength = float(np.clip(1.0 - prob_crash / max(thr, 1e-6), 0.0, 1.0))
 
     # 8. PORTFOLIO ALLOCATION (ENFORCE BASE_SAFE_CORE)
     risk_alloc = signal_strength * MAX_RISK_ALLOCATION
 
     if is_shock:
-        print(f"!!! SHOCK TRIGGERED (Ret: {latest_ret:.2%}, VixJump2D: {vix_jump:.2%}) !!!")
+        date_str = df.index[-1].strftime("%Y-%m-%d")
+        print("=" * 60)
+        if FORCE_SHOCK_ALERT:
+            print("🧪 TEST ALERT - FORCED SHOCK 🧪")
+        else:
+            print("🚨 SHOCK DETECTED 🚨")
+        print("=" * 60)
+        print(f"Date: {date_str}")
+        print(f"MERVAL Return: {latest_ret:.2%} (threshold: {SHOCK_DAILY_RET:.2%})")
+        print(f"VIX Jump (2d): {vix_jump:.2%} (threshold: {VIX_JUMP_2D:.2%})")
+        print(f"Action: Moving to 100% SPY (safe core)")
+        print("=" * 60)
+        
+        # Log to Cloud Logging (triggers email alert)
+        log_shock_alert(date_str, latest_ret, vix_jump, forced=FORCE_SHOCK_ALERT)
+        
         risk_alloc = 0.0
 
     exposure_ggal = float(np.clip(risk_alloc, 0.0, MAX_RISK_ALLOCATION))
-
-    # Enforce safe core floor and keep weights summing to 1
     exposure_spy = max(BASE_SAFE_CORE, 1.0 - exposure_ggal)
     exposure_spy = float(np.clip(exposure_spy, 0.0, 1.0))
     exposure_ggal = float(np.clip(1.0 - exposure_spy, 0.0, MAX_RISK_ALLOCATION))
